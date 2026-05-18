@@ -27,15 +27,16 @@ def create_run_dir(output_dir: Path) -> Path:
         Newly-created run directory.
     """
     timestamp = datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    run_dir = output_dir / timestamp
     suffix = 1
+    run_dir = output_dir / timestamp
 
-    while run_dir.exists():
-        run_dir = output_dir / f"{timestamp}-{suffix:02d}"
-        suffix += 1
-
-    run_dir.mkdir(parents=True, exist_ok=False)
-    return run_dir
+    while True:
+        try:
+            run_dir.mkdir(parents=True, exist_ok=False)
+            return run_dir
+        except FileExistsError:
+            run_dir = output_dir / f"{timestamp}-{suffix:02d}"
+            suffix += 1
 
 
 def create_data_loader_generator(seed: int) -> torch.Generator:
@@ -186,8 +187,8 @@ def train(config_path: Path) -> None:
     Args:
         config_path: Path to experiment config.
     """
-    config_path = Path(config_path)
-    project_root = config_path.resolve().parents[1]
+    config_path = Path(config_path).expanduser().resolve()
+    project_root = config_path.parents[1]
     config = load_config(config_path)
 
     seed_everything(int(config["project"]["seed"]))
