@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Local experiment artifacts
+checkpoints/
+runs/
+outputs/
+*.pt
+*.pth
+
+# Keep real/local inspection data out of git.
+data/*
+!data/README.md
+
+# Notebook runtime output
+.ipynb_checkpoints/
