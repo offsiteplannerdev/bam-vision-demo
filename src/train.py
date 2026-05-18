@@ -1,9 +1,11 @@
 import argparse
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import torch
+import yaml
 from torch import nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import StepLR
@@ -12,7 +14,42 @@ from torch.utils.data import DataLoader
 from src.dataset import CarPartDefectDataset
 from src.model import DefectClassifier
 from src.transforms import get_train_transforms, get_val_transforms
-from src.utils import load_config, seed_everything, setup_logger
+from src.utils import load_config, seed_everything, seed_worker, setup_logger
+
+
+def create_run_dir(output_dir: Path) -> Path:
+    """Creates a unique timestamped run directory.
+
+    Args:
+        output_dir: Parent directory for training runs.
+
+    Returns:
+        Newly-created run directory.
+    """
+    timestamp = datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_dir = output_dir / timestamp
+    suffix = 1
+
+    while run_dir.exists():
+        run_dir = output_dir / f"{timestamp}-{suffix:02d}"
+        suffix += 1
+
+    run_dir.mkdir(parents=True, exist_ok=False)
+    return run_dir
+
+
+def create_data_loader_generator(seed: int) -> torch.Generator:
+    """Creates a seeded torch generator for DataLoader randomness.
+
+    Args:
+        seed: Seed used by PyTorch when shuffling and spawning workers.
+
+    Returns:
+        Seeded PyTorch generator.
+    """
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    return generator
 
 
 def build_dataloaders(config: dict[str, Any], project_root: Path) -> tuple[DataLoader, DataLoader]:
@@ -28,6 +65,7 @@ def build_dataloaders(config: dict[str, Any], project_root: Path) -> tuple[DataL
     data_config = config["data"]
     training_config = config["training"]
     img_size = int(data_config["img_size"])
+    data_seed = int(data_config.get("seed", config["project"]["seed"]))
 
     train_dir = project_root / Path(data_config["train_dir"])
     val_dir = project_root / Path(data_config["val_dir"])
@@ -41,6 +79,8 @@ def build_dataloaders(config: dict[str, Any], project_root: Path) -> tuple[DataL
         shuffle=True,
         num_workers=int(data_config["num_workers"]),
         pin_memory=torch.cuda.is_available(),
+        worker_init_fn=seed_worker,
+        generator=create_data_loader_generator(data_seed),
     )
     val_loader = DataLoader(
         val_dataset,
@@ -48,6 +88,8 @@ def build_dataloaders(config: dict[str, Any], project_root: Path) -> tuple[DataL
         shuffle=False,
         num_workers=int(data_config["num_workers"]),
         pin_memory=torch.cuda.is_available(),
+        worker_init_fn=seed_worker,
+        generator=create_data_loader_generator(data_seed + 1),
     )
     return train_loader, val_loader
 
@@ -57,7 +99,6 @@ def train_one_epoch(
     loader: DataLoader,
     criterion: nn.Module,
     optimizer: torch.optim.Optimizer,
-    scheduler: StepLR,
     device: torch.device,
 ) -> tuple[float, float]:
     """Runs one training epoch.
@@ -67,7 +108,6 @@ def train_one_epoch(
         loader: Training data loader.
         criterion: Loss function.
         optimizer: Optimizer.
-        scheduler: Learning rate scheduler.
         device: Target device.
 
     Returns:
@@ -79,20 +119,22 @@ def train_one_epoch(
     total = 0
 
     for images, labels in loader:
-        images = images.to(device)
-        labels = labels.to(device)
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
         logits = model(images)
         loss = criterion(logits, labels)
         loss.backward()
         optimizer.step()
-        scheduler.step()
 
         batch_size = labels.size(0)
         total_loss += loss.item() * batch_size
         correct += (logits.argmax(dim=1) == labels).sum().item()
         total += batch_size
+
+    if total == 0:
+        raise ValueError("Training loader did not yield any samples")
 
     return total_loss / total, correct / total
 
@@ -121,8 +163,8 @@ def evaluate(
     total = 0
 
     for images, labels in loader:
-        images = images.to(device)
-        labels = labels.to(device)
+        images = images.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
 
         logits = model(images)
         loss = criterion(logits, labels)
@@ -131,6 +173,9 @@ def evaluate(
         total_loss += loss.item() * batch_size
         correct += (logits.argmax(dim=1) == labels).sum().item()
         total += batch_size
+
+    if total == 0:
+        raise ValueError("Validation loader did not yield any samples")
 
     return total_loss / total, correct / total
 
@@ -149,7 +194,10 @@ def train(config_path: Path) -> None:
     logger = setup_logger("bam_vision.train")
 
     output_dir = project_root / Path(config["project"]["output_dir"])
-    output_dir.mkdir(parents=True, exist_ok=True)
+    run_dir = create_run_dir(output_dir)
+    logger.info("Loaded config from %s", config_path)
+    logger.info("Experiment config:\n%s", yaml.safe_dump(config, sort_keys=True))
+    logger.info("Writing run artifacts to %s", run_dir)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Using device: %s", device)
@@ -173,9 +221,9 @@ def train(config_path: Path) -> None:
         gamma=float(training_config["scheduler_gamma"]),
     )
 
-    best_val_acc = 0.0
+    best_val_acc = float("-inf")
     for epoch in range(1, int(training_config["epochs"]) + 1):
-        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, scheduler, device)
+        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device)
         val_loss, val_acc = evaluate(model, val_loader, criterion, device)
 
         logger.info(
@@ -187,16 +235,22 @@ def train(config_path: Path) -> None:
             val_acc,
             optimizer.param_groups[0]["lr"],
         )
+        scheduler.step()
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            checkpoint_path = output_dir / "best_model.pt"
+            checkpoint_path = run_dir / f"best_model_epoch_{epoch:03d}.pt"
             torch.save(
                 {
                     "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
                     "config": config,
                     "epoch": epoch,
                     "val_acc": val_acc,
+                    "train_loss": train_loss,
+                    "train_acc": train_acc,
+                    "val_loss": val_loss,
                 },
                 checkpoint_path,
             )
