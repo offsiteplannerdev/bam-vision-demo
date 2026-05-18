@@ -59,6 +59,7 @@ python -m src.train --config configs/default.yaml
 ## Notes For Agents
 
 - This repository is intentionally not production-ready.
+- The dataset pipeline is not built yet; raw CVAT ingestion, splitting, augmentation balancing, and dataset statistics reporting are still TODOs.
 - Do not silently replace the simple CNN with a pretrained model unless requested.
 - If adding tests, keep them focused and avoid requiring real manufacturing images.
 - If touching training behavior, run or at least syntax-check the training entry point when full dependency installation is unavailable.
