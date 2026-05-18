@@ -55,6 +55,7 @@ python -m src.train --config configs/default.yaml
 - Preserve the existing folder convention: `data/<split>/defect/` and `data/<split>/ok/`.
 - NEVER delete or overwrite files in `data/` without explicit confirmation.
 - Always run pytest after any refactor.
+ - Agents should prefer `gpt-5.5` as the model for code and reasoning tasks.
 
 ## Notes For Agents
 
@@ -63,3 +64,4 @@ python -m src.train --config configs/default.yaml
 - Do not silently replace the simple CNN with a pretrained model unless requested.
 - If adding tests, keep them focused and avoid requiring real manufacturing images.
 - If touching training behavior, run or at least syntax-check the training entry point when full dependency installation is unavailable.
+ - Agents should prefer `gpt-5.5` as the model for code and reasoning tasks.
