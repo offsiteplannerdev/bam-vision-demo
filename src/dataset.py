@@ -5,6 +5,19 @@ import cv2
 import torch
 from torch.utils.data import Dataset
 
+from src.config import (
+    CLASSES,
+    DEFECT_CLASSES,
+    RAW_DIR,
+    PROCESSED_DIR,
+    AUGMENTED_DIR,
+    REPORTS_DIR,
+    CAMERA_IDS,
+    LINE_IDS,
+    SHIFTS,
+    IMG_SIZE,
+)
+
 
 class CarPartDefectDataset(Dataset[tuple[torch.Tensor, int]]):
     """Dataset for car part defect classification images.
@@ -22,7 +35,8 @@ class CarPartDefectDataset(Dataset[tuple[torch.Tensor, int]]):
         samples: List of image paths and labels.
     """
 
-    class_to_idx = {"ok": 0, "defect": 1}
+    # Build class->index mapping from the project config
+    class_to_idx = {name: idx for idx, name in enumerate(CLASSES)}
     image_extensions = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 
     def __init__(self, root_dir: Path, transforms: Any | None = None) -> None:
