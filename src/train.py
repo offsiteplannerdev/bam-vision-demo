@@ -1,5 +1,6 @@
 import argparse
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +13,41 @@ from torch.utils.data import DataLoader
 from src.dataset import CarPartDefectDataset
 from src.model import DefectClassifier
 from src.transforms import get_train_transforms, get_val_transforms
-from src.utils import load_config, seed_everything, setup_logger
+from src.utils import load_config, seed_everything, seed_worker, setup_logger
+
+
+def _resolve_project_path(path: str | Path, project_root: Path) -> Path:
+    """Resolves absolute or project-relative filesystem paths."""
+    candidate = Path(path).expanduser()
+    if candidate.is_absolute():
+        return candidate
+    return project_root / candidate
+
+
+def _resolve_config_path(config_path: Path, project_root: Path) -> Path:
+    """Resolves config paths from the current directory or project root."""
+    candidate = Path(config_path).expanduser()
+    if candidate.is_absolute():
+        return candidate.resolve()
+
+    cwd_candidate = (Path.cwd() / candidate).resolve()
+    if cwd_candidate.exists():
+        return cwd_candidate
+
+    return (project_root / candidate).resolve()
+
+
+def _create_run_dir(output_dir: Path) -> Path:
+    """Creates a timestamped run directory without overwriting earlier runs."""
+    timestamp = datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    run_dir = output_dir / timestamp
+    suffix = 1
+    while run_dir.exists():
+        run_dir = output_dir / f"{timestamp}-{suffix:02d}"
+        suffix += 1
+
+    run_dir.mkdir(parents=True, exist_ok=False)
+    return run_dir
 
 
 def build_dataloaders(config: dict[str, Any], project_root: Path) -> tuple[DataLoader, DataLoader]:
@@ -28,26 +63,37 @@ def build_dataloaders(config: dict[str, Any], project_root: Path) -> tuple[DataL
     data_config = config["data"]
     training_config = config["training"]
     img_size = int(data_config["img_size"])
+    num_workers = int(data_config["num_workers"])
+    data_seed = int(data_config.get("seed", config["project"]["seed"]))
 
-    train_dir = project_root / Path(data_config["train_dir"])
-    val_dir = project_root / Path(data_config["val_dir"])
+    train_dir = _resolve_project_path(data_config["train_dir"], project_root)
+    val_dir = _resolve_project_path(data_config["val_dir"], project_root)
 
     train_dataset = CarPartDefectDataset(train_dir, transforms=get_train_transforms(img_size))
     val_dataset = CarPartDefectDataset(val_dir, transforms=get_val_transforms(img_size))
+
+    train_generator = torch.Generator()
+    train_generator.manual_seed(data_seed)
+    val_generator = torch.Generator()
+    val_generator.manual_seed(data_seed + 1)
 
     train_loader = DataLoader(
         train_dataset,
         batch_size=int(training_config["batch_size"]),
         shuffle=True,
-        num_workers=int(data_config["num_workers"]),
+        num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
+        worker_init_fn=seed_worker,
+        generator=train_generator,
     )
     val_loader = DataLoader(
         val_dataset,
         batch_size=int(training_config["batch_size"]),
         shuffle=False,
-        num_workers=int(data_config["num_workers"]),
+        num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
+        worker_init_fn=seed_worker,
+        generator=val_generator,
     )
     return train_loader, val_loader
 
@@ -57,7 +103,6 @@ def train_one_epoch(
     loader: DataLoader,
     criterion: nn.Module,
     optimizer: torch.optim.Optimizer,
-    scheduler: StepLR,
     device: torch.device,
 ) -> tuple[float, float]:
     """Runs one training epoch.
@@ -67,7 +112,6 @@ def train_one_epoch(
         loader: Training data loader.
         criterion: Loss function.
         optimizer: Optimizer.
-        scheduler: Learning rate scheduler.
         device: Target device.
 
     Returns:
@@ -87,7 +131,6 @@ def train_one_epoch(
         loss = criterion(logits, labels)
         loss.backward()
         optimizer.step()
-        scheduler.step()
 
         batch_size = labels.size(0)
         total_loss += loss.item() * batch_size
@@ -141,15 +184,20 @@ def train(config_path: Path) -> None:
     Args:
         config_path: Path to experiment config.
     """
-    config_path = Path(config_path)
-    project_root = config_path.resolve().parents[1]
+    project_root = Path(__file__).resolve().parents[1]
+    config_path = _resolve_config_path(Path(config_path), project_root)
     config = load_config(config_path)
 
     seed_everything(int(config["project"]["seed"]))
     logger = setup_logger("bam_vision.train")
 
-    output_dir = project_root / Path(config["project"]["output_dir"])
+    logger.info("Loaded config from %s", config_path)
+    logger.info("Experiment config: %s", config)
+
+    output_dir = _resolve_project_path(config["project"]["output_dir"], project_root)
     output_dir.mkdir(parents=True, exist_ok=True)
+    run_dir = _create_run_dir(output_dir)
+    logger.info("Writing run artifacts to %s", run_dir)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Using device: %s", device)
@@ -175,7 +223,8 @@ def train(config_path: Path) -> None:
 
     best_val_acc = 0.0
     for epoch in range(1, int(training_config["epochs"]) + 1):
-        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, scheduler, device)
+        current_lr = optimizer.param_groups[0]["lr"]
+        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device)
         val_loss, val_acc = evaluate(model, val_loader, criterion, device)
 
         logger.info(
@@ -185,15 +234,18 @@ def train(config_path: Path) -> None:
             train_acc,
             val_loss,
             val_acc,
-            optimizer.param_groups[0]["lr"],
+            current_lr,
         )
+        scheduler.step()
 
         if val_acc > best_val_acc:
             best_val_acc = val_acc
-            checkpoint_path = output_dir / "best_model.pt"
+            checkpoint_path = run_dir / f"best_model_epoch{epoch:03d}_val_acc{val_acc:.4f}.pt"
             torch.save(
                 {
                     "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
                     "config": config,
                     "epoch": epoch,
                     "val_acc": val_acc,
