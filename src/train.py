@@ -21,6 +21,8 @@ def _resolve_project_path(path: str | Path, project_root: Path) -> Path:
     candidate = Path(path).expanduser()
     if candidate.is_absolute():
         return candidate
+
+    # Config paths are stored relative to the repository root by default.
     return project_root / candidate
 
 
