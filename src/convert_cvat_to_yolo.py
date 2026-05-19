@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass, field
+import math
 from pathlib import Path
 import xml.etree.ElementTree as ET
 
@@ -286,9 +287,13 @@ def _required_float(element: ET.Element, attribute: str, xml_path: Path, image_n
         raise ValueError(f"Missing {attribute!r} for image {image_name!r} in {xml_path}")
 
     try:
-        return float(raw_value)
+        value = float(raw_value)
     except ValueError as exc:
         raise ValueError(f"Invalid {attribute!r} value for image {image_name!r} in {xml_path}: {raw_value}") from exc
+
+    if not math.isfinite(value):
+        raise ValueError(f"Non-finite {attribute!r} value for image {image_name!r} in {xml_path}: {raw_value}")
+    return value
 
 
 def _label_relative_path(image_name: str) -> Path:
@@ -318,7 +323,18 @@ def _summarize_labels(image_labels: list[ImageLabels]) -> ConversionSummary:
 def _write_yolo_dataset(image_labels: list[ImageLabels], output_dir: Path, *, overwrite: bool) -> None:
     labels_dir = output_dir / "labels"
     data_yaml_path = output_dir / "data.yaml"
-    output_paths = [labels_dir / labels.label_relative_path for labels in image_labels] + [data_yaml_path]
+    expected_label_paths = {labels_dir / labels.label_relative_path for labels in image_labels}
+    output_paths = sorted(expected_label_paths) + [data_yaml_path]
+
+    if labels_dir.exists():
+        stale_label_paths = sorted(path for path in labels_dir.rglob("*.txt") if path not in expected_label_paths)
+        if stale_label_paths:
+            stale_labels = "\n".join(f"  - {path}" for path in stale_label_paths[:10])
+            raise FileExistsError(
+                "YOLO labels directory contains stale label files not present in the current CVAT XML. "
+                "Use a clean output directory or remove stale labels manually:\n"
+                f"{stale_labels}"
+            )
 
     existing_paths = [path for path in output_paths if path.exists()]
     if existing_paths and not overwrite:
